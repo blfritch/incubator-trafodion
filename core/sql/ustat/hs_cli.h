@@ -901,7 +901,7 @@ public:
       if (closeStmtNeeded_)
         {
           retcode = SQL_EXEC_CloseStmt(stmt_);
-          if (!retcode)
+          if (retcode >= 0)
             closeStmtNeeded_ = FALSE;
         }
       return retcode;

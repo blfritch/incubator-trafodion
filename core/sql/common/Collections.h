@@ -544,6 +544,15 @@ protected:                                                // NT_PORT SK 04/08/97
      heap_ = heap;
    }
 
+protected:
+  inline virtual T* getArrIfIntact() const
+  {
+    if (usedLength_ == entries_)
+      return arr_;
+    else
+      return NULL;
+  }
+
 private:
 
   CollIndex maxLength_;  // how many array entries are allocated?

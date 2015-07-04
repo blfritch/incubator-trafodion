@@ -40,8 +40,9 @@
 #include "BloomFilter.h"
 #include "nawstring.h"
 #include "Collections.h"
-#include "ComVersionDefs.h" 	
+#include "ComVersionDefs.h"
 #include "NABitVector.h"
+#include "CharType.h"
 #include <exp_function.h>
 
 // -----------------------------------------------------------------------
@@ -118,17 +119,26 @@ class ISFixedChar
       content = other.content;
     }
 
-    void static setLength(Int32 len)
+    static void setStaticMembers(UInt32 len, CharType* charTypeInfo)
+    {
+      setLength(len);
+      setCaseInsensitive(charTypeInfo->isCaseinsensitive());
+      setColCollation(charTypeInfo->getCollation());
+      setCharSet(charTypeInfo->getCharSet());
+      setCharType(charTypeInfo);
+    }
+
+    static void setLength(Int32 len)
     {
       length = len;
     }
 
-    Int32 static getLength()
+    static UInt32 getLength()
     {
       return length;
     }
 
-    void static setCaseInsensitive(NABoolean ci)
+    static void setCaseInsensitive(NABoolean ci)
     {
       caseInsensitive = ci;
     }
@@ -143,7 +153,17 @@ class ISFixedChar
       charset = CharSet;
     }
 
-    char* getContent()
+    static void setCharType(CharType* newCharType)
+    {
+      charType = newCharType;
+    }
+
+    static CharType* getCharType()
+    {
+      return charType;
+    }
+
+    char* getContent() const
     {
       return content;
     }
@@ -236,14 +256,19 @@ class ISFixedChar
     // Give internal error if undefined operator invoked.
     void fail(const char* opName, Lng32 line);
 
-    // To make ISFixedChar as lightweight as possible, we use a static member to hold
-    // the length and case sensitivity, rather than repeating it for each instance. 
+    // To make ISFixedChar as lightweight as possible, we use static members to hold
+    // the length, character set, etc., rather than repeating it for each instance.
     // These must be set before each char column is processed.
-    // Likewise with column collation.
-    static THREAD_P Int32 length;
+    // The CharType member was added because an argument of that type is required
+    // by the encoding function used for faststats. It entails the information
+    // provided by the other static members, and they could be eliminated if there
+    // is not a significant performance hit in accessing the info via an additional
+    // pointer reference in the comparison functions, which are heavily used by IS.
+    static THREAD_P UInt32 length;
     static THREAD_P NABoolean caseInsensitive;
     static THREAD_P CharInfo::Collation colCollation;
     static THREAD_P CharInfo::CharSet charset;
+    static THREAD_P CharType* charType;    // Used by faststats for encoding
 
     // The content is a fixed-length string, where the length is the current
     // value of the static 'length' member variable.
@@ -307,14 +332,14 @@ class ISVarChar
       : content(NULL)
     {}
 
-    char* getContent()
+    char* getContent() const
     {
       return content;
     }
 
-    short getLength()
+    short getLength() const
     {
-      return *(Int16*)content; 
+      return *(UInt16*)content;
     }
 
     void setContent(char* ptr)
@@ -322,7 +347,16 @@ class ISVarChar
       content = ptr;
     }
 
-    void static setDeclaredLength(Int32 len)
+    static void setStaticMembers(UInt32 len, CharType* charTypeInfo)
+    {
+      setDeclaredLength(len);
+      setCaseInsensitive(charTypeInfo->isCaseinsensitive());
+      setColCollation(charTypeInfo->getCollation());
+      setCharSet(charTypeInfo->getCharSet());
+      setCharType(charTypeInfo);
+    }
+
+    void static setDeclaredLength(UInt32 len)
     {
       declaredLength = len;
     }
@@ -340,6 +374,16 @@ class ISVarChar
     static void setCharSet(CharInfo::CharSet CharSet)
     {
       charset = CharSet;
+    }
+
+    static void setCharType(CharType* newCharType)
+    {
+      charType = newCharType;
+    }
+
+    static CharType* getCharType()
+    {
+      return charType;
     }
 
     // Have to define new[] and delete[] here if we want to use NAHeap. Even if
@@ -418,10 +462,11 @@ class ISVarChar
     // To make ISVarChar as lightweight as possible, we use a static members to
     // hold column attributes, rather than repeating them for each instance. 
     // They must be set before each char column is processed.
-    static THREAD_P Int32 declaredLength;
+    static THREAD_P UInt32 declaredLength;
     static THREAD_P NABoolean caseInsensitive;
     static THREAD_P CharInfo::Collation colCollation;
     static THREAD_P CharInfo::CharSet charset;
+    static THREAD_P CharType* charType;    // Used by faststats for encoding
 
     // The content pointed to by objects of this class consists of a 2-byte
     // field giving the length in bytes, immediately followed by a string
@@ -1137,6 +1182,7 @@ struct HSColGroupStruct : public NABasicObject
     void* MFVValues;                               /* List of MFV values for IUS */
 
     AbstractFastStatsHist* fastStatsHist;
+    CharType* charTypeInfo;                        /* Used by faststats for encoding strings */
 
     // These member items are used for internal sort of multi-column groups.
     NABitVector*       mcis_nullIndBitMap;           /* used by MC */
@@ -1181,6 +1227,7 @@ struct HSColGroupStruct : public NABasicObject
                                NABoolean recalcMemNeeded = FALSE);
     void freeISMemory(NABoolean freeStrData = TRUE, NABoolean freeMCData=TRUE);
     NAString generateTextForColumnCast();
+    void setCharTypeInfo();
   };
 
 
@@ -1373,7 +1420,7 @@ public:
     {
       return (((defaultHbaseCatName != NULL) && (catName == (*defaultHbaseCatName))) ||
               ((catName == TRAFODION_SYSCAT_LIT) ||
-	       (catName == HBASE_SYSTEM_CATALOG)));
+               (catName == HBASE_SYSTEM_CATALOG)));
     }
 
     static NABoolean isHBaseMeta(const NAString& schName)
@@ -1631,7 +1678,7 @@ private:
 
     //Generated unique histogram IDs for all groups
     Lng32 MakeAllHistid();
-	
+
     //Builds group list from HISTOGRAMS table
     Lng32 groupListFromTable(HSColGroupStruct*& groupList,
                              NABoolean skipEmpty=FALSE,
@@ -1996,6 +2043,11 @@ class FrequencyCounts
   // merge frequency counts into specified object (i.e., f)
   void mergeTo(FrequencyCounts &f);
 
+  // Remove any frequencies beyond given skew limit, return count of remaining keys.
+  void removeSkew(Int32 skewLimit, Int32& numKeys);
+
+  void display(FILE* out = stdout);
+
  private:
   // Copy constructor is left undefined.
   FrequencyCounts(const FrequencyCounts& other);
@@ -2007,6 +2059,7 @@ class FrequencyCounts
   // hash table entry
   struct entry 
   {
+    entry() : ix_(0), value_(0), next_(0) {}
     ULng32 ix_;
     ULng32 value_;
     struct entry *next_;
@@ -2075,6 +2128,11 @@ public:
     HSHistogram(Lng32 intcount, Int64 rowcount, Lng32 gapIntervals, Lng32 highFreqIntervals,
                 NABoolean sampleUsed = FALSE,
                 NABoolean singleIntervalPerUec = FALSE);
+
+    // This ctor used exclusively by the faststats algorithm, which only uses
+    // enough of HSHistogram to be able to call FlushStatistics().
+    HSHistogram(Lng32 currentInt);
+
     ~HSHistogram();
 
     void deleteFiArray();
@@ -2134,10 +2192,18 @@ public:
     // the number of intervals actually used (intCount_ is the number available).
     void setCurrentInt(const Lng32 numInts) { currentInt_ = numInts; }
     void setHasNull(NABoolean val) { hasNull_ = val; }
+
+    // Used by IUS.
     void setIntBoundary(const Lng32 intNum, const char* value, Int16 len)
       { intArry_[intNum].boundary_.copyFrom(value, len, TRUE); }
     void setIntMFVValue(const Lng32 intNum, const char* value, Int16 len)
       { intArry_[intNum].mostFreqVal_.copyFrom(value, len, TRUE); }
+
+    // Used by faststats.
+    void setIntBoundary(const Lng32 intNum, HSDataBuffer& boundary)
+      { intArry_[intNum].boundary_ = boundary; }
+    void setIntMFVValue(const Lng32 intNum, HSDataBuffer& boundary)
+      { intArry_[intNum].mostFreqVal_= boundary; }
 
     void adjustMFVand2MFV(const Lng32 i, double newEstRow, double newEstUec);
     void setIntSquareSum(const Lng32 intNum, double sum) {intArry_[intNum].squareCntSum_ = sum;}

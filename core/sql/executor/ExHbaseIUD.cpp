@@ -1299,7 +1299,6 @@ ExWorkProcRetcode ExHbaseAccessBulkLoadPrepSQTcb::work()
       matches_ = 0;
       currRowNum_ = 0;
       numRetries_ = 0;
-      hFileParamsInitialized_ = FALSE;
       prevTailIndex_ = 0;
       lastHandledStep_ = NOT_STARTED;
 
@@ -1326,7 +1325,7 @@ ExWorkProcRetcode ExHbaseAccessBulkLoadPrepSQTcb::work()
 
       if (!hFileParamsInitialized_)
       {
-              importLocation_= std::string(((ExHbaseAccessTdb&)hbaseAccessTdb()).getLoadPrepLocation()) +
+        importLocation_= std::string(((ExHbaseAccessTdb&)hbaseAccessTdb()).getLoadPrepLocation()) +
             ((ExHbaseAccessTdb&)hbaseAccessTdb()).getTableName() ;
         familyLocation_ = std::string(importLocation_ + "/#1");
         Lng32 fileNum = getGlobals()->castToExExeStmtGlobals()->getMyInstanceNumber();
@@ -1335,56 +1334,62 @@ ExWorkProcRetcode ExHbaseAccessBulkLoadPrepSQTcb::work()
         snprintf(hFileName, 50, "hfile%d", fileNum);
         hFileName_ = hFileName;
 
-          NAString hiveDDL;
-          NAString hiveSampleTblNm;
-          if (samplingRate > 0 && fileNum == 0) // master exec creates hive sample table
-          {
-            hiveSampleTblNm = ((ExHbaseAccessTdb&)hbaseAccessTdb()).getTableName();
-            TrafToHiveSampleTableName(hiveSampleTblNm);
-            getHiveCreateTableDDL(hiveSampleTblNm, hiveDDL);
-          }
-          retcode = ehi_->initHFileParams(table_, familyLocation_, hFileName_,
-                                          hbaseAccessTdb().getMaxHFileSize(),
-                                          hiveSampleTblNm.data(), hiveDDL.data());
+        NAString hiveDDL;
+        NAString hiveSampleTblNm;
+        if (samplingRate > 0 && fileNum == 0) // master exec creates hive sample table
+        {
+          hiveSampleTblNm = ((ExHbaseAccessTdb&)hbaseAccessTdb()).getTableName();
+          TrafToHiveSampleTableName(hiveSampleTblNm);
+          getHiveCreateTableDDL(hiveSampleTblNm, hiveDDL);
+        }
+        retcode = ehi_->initHFileParams(table_, familyLocation_, hFileName_,
+                                        hbaseAccessTdb().getMaxHFileSize(),
+                                        hiveSampleTblNm.data(), hiveDDL.data());
         hFileParamsInitialized_ = true;
 
-          if (samplingRate > 0)
-          {
-            // Seed random number generator (used to select rows to write to sample table).
-            srand(time(0));
-
-            // Set up HDFS file for sample table.
-            hdfs_ = hdfsConnect("default", 0);
-            Text samplePath = std::string(((ExHbaseAccessTdb&)hbaseAccessTdb()).getSampleLocation()) +
-                                          ((ExHbaseAccessTdb&)hbaseAccessTdb()).getTableName() ;
-            char filePart[10];
-            sprintf(filePart, "/%d", fileNum);
-            samplePath.append(filePart);
-            hdfsSampleFile_ = hdfsOpenFile(hdfs_, samplePath.data(), O_WRONLY|O_CREAT, 0, 0, 0);
-          }
-
-          posVec_.clear();
-          hbaseAccessTdb().listOfUpdatedColNames()->position();
-          while (NOT hbaseAccessTdb().listOfUpdatedColNames()->atEnd())
-          {
-            UInt32 pos = *(UInt32*) hbaseAccessTdb().listOfUpdatedColNames()->getCurr();
-            posVec_.push_back(pos);
-            hbaseAccessTdb().listOfUpdatedColNames()->advance();
-            numCols++;
-          }
-        }
-        if (setupError(retcode, "ExpHbaseInterface::createHFile"))
+        if (samplingRate > 0)
         {
-          step_ = HANDLE_ERROR;
-          break;
+          // Seed random number generator (used to select rows to write to sample table).
+          srand(time(0));
+
+          // Set up HDFS file for sample table.
+          hdfs_ = hdfsConnect("default", 0);
+          Text samplePath = std::string(((ExHbaseAccessTdb&)hbaseAccessTdb()).getSampleLocation()) +
+                                        ((ExHbaseAccessTdb&)hbaseAccessTdb()).getTableName() ;
+          char filePart[10];
+          sprintf(filePart, "/%d", fileNum);
+          samplePath.append(filePart);
+          hdfsSampleFile_ = hdfsOpenFile(hdfs_, samplePath.data(), O_WRONLY|O_CREAT, 0, 0, 0);
         }
-        allocateDirectRowBufferForJNI(
-                 numCols,
-                 hbaseAccessTdb().getHbaseRowsetVsbbSize());
-        allocateDirectRowIDBufferForJNI(hbaseAccessTdb().getHbaseRowsetVsbbSize());
-        step_ = SETUP_INSERT;
-       }
-       break;
+
+        posVec_.clear();
+        hbaseAccessTdb().listOfUpdatedColNames()->position();
+        while (NOT hbaseAccessTdb().listOfUpdatedColNames()->atEnd())
+        {
+          UInt32 pos = *(UInt32*) hbaseAccessTdb().listOfUpdatedColNames()->getCurr();
+          posVec_.push_back(pos);
+          hbaseAccessTdb().listOfUpdatedColNames()->advance();
+          numCols++;
+        }
+
+        // Now that posVec_ has been filled, calculate needed length of buffer
+        // for Hive sample table and allocate it.
+        if (samplingRate > 0)
+          allocateHiveSampleTableBuffer(hbaseAccessTdb().convertTuppIndex_, &posVec_);
+      }
+
+      if (setupError(retcode, "ExpHbaseInterface::createHFile"))
+      {
+        step_ = HANDLE_ERROR;
+        break;
+      }
+      allocateDirectRowBufferForJNI(
+               numCols,
+               hbaseAccessTdb().getHbaseRowsetVsbbSize());
+      allocateDirectRowIDBufferForJNI(hbaseAccessTdb().getHbaseRowsetVsbbSize());
+      step_ = SETUP_INSERT;
+      }
+        break;
 
       case SETUP_INSERT:
       {

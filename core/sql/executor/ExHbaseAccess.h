@@ -312,6 +312,7 @@ protected:
                                       NABoolean isUpdate,
                                       std::vector<UInt32> * posVec );
 
+  void allocateHiveSampleTableBuffer(UInt16 tuppIndex, std::vector<UInt32>* posVec);
   short createDirectRowBuffer(UInt16 tuppIndex, char * tuppRow, 
                         Queue * listOfColNames,
 			NABoolean isUpdate = FALSE,
@@ -477,8 +478,12 @@ protected:
   NABoolean *resultArray_;
   Int32 asyncOperationTimeout_;
 
-  // Redefined and used by ExHbaseAccessBulkLoadPrepSQTcb.
+  // Buffer used for writing to Hive sample table in createDirectRowBuffer().
+  // Allocated in allocateHiveSampleTableBuffer().
+  char* hiveBuff_;
+  size_t hiveBuffSz_;
 
+  // Redefined and used by ExHbaseAccessBulkLoadPrepSQTcb.
   virtual hdfsFS getHdfs() const { return NULL; }
   virtual hdfsFile getHdfsSampleFile() const { return NULL; }
 };

@@ -37,6 +37,8 @@
 #include "exp_function.h"
 #include "jni.h"
 #include "hdfs.h"
+#include "exp_datetime.h"
+#include "exp_bignum.h"
 #include <random>
 
 // forward declare
@@ -236,6 +238,8 @@ ExHbaseAccessTcb::ExHbaseAccessTcb(
   , colValVec_(NULL)
   , colValVecSize_(0)
   , colValEntry_(0)
+  , hiveBuff_(NULL)
+  , hiveBuffSz_(0)
 {
   Space * space = (glob ? glob->getSpace() : NULL);
   CollHeap * heap = (glob ? glob->getDefaultHeap() : NULL);
@@ -486,6 +490,8 @@ void ExHbaseAccessTcb::freeResources()
      NADELETEBASIC(directRowBuffer_, getHeap());
   if (colVal_.val != NULL)
      NADELETEBASIC(colVal_.val, getHeap());
+  if (hiveBuff_ != NULL)
+     NADELETEBASIC(hiveBuff_, getHeap());
 }
 
 
@@ -2439,6 +2445,163 @@ short ExHbaseAccessTcb::copyRowIDToDirectBuffer(HbaseStr &rowID)
    return 0;
 }
 
+// Examine the datatypes of the columns represented by a tuple descriptor to
+// determine the size of the buffer needed for writing a row of the Hive
+// sample table written during a bulk load with ustat sampling.
+void ExHbaseAccessTcb::allocateHiveSampleTableBuffer(UInt16 tuppIndex, std::vector<UInt32>* posVec)
+{
+  ExpTupleDesc* rowTD = hbaseAccessTdb().workCriDesc_->getTupleDescriptor(tuppIndex);
+  Attributes* attr;
+  Lng32 len;
+
+  hiveBuffSz_ = 0;
+
+  for (Lng32 i = 0; i <  rowTD->numAttrs(); i++)
+    {
+      if (!posVec)
+        attr = rowTD->getAttr(i);
+      else
+        attr = rowTD->getAttr((*posVec)[i] -1);
+
+      len = 0;
+      switch (attr->getDatatype())
+      {
+        case REC_BIN16_SIGNED:
+          len = SQL_SMALL_DISPLAY_SIZE;
+          break;
+
+        case REC_BIN16_UNSIGNED:
+        case REC_BPINT_UNSIGNED:
+          len = SQL_USMALL_DISPLAY_SIZE;
+          break;
+
+        case REC_BIN32_SIGNED:
+          len = SQL_INT_DISPLAY_SIZE;
+          break;
+
+        case REC_BIN32_UNSIGNED:
+          len = SQL_UINT_DISPLAY_SIZE;
+          break;
+
+        case REC_BIN64_SIGNED:
+          len = SQL_LARGE_DISPLAY_SIZE;
+          break;
+
+        case REC_IEEE_FLOAT32:
+        case REC_TDM_FLOAT32:
+          len = SQL_REAL_DISPLAY_SIZE;
+          break;
+
+        case REC_IEEE_FLOAT64:
+        case REC_TDM_FLOAT64:
+          len = SQL_DOUBLE_PRECISION_DISPLAY_SIZE;
+          break;
+
+        case REC_BYTE_F_ASCII:
+        case REC_BYTE_V_ASCII:
+          len = attr->getLength();
+          break;
+
+        case REC_BYTE_F_DOUBLE:
+        case REC_BYTE_V_DOUBLE:
+          len = 3 * (attr->getLength() / 2);
+          break;
+
+        // All decimal numbers are stored as scaled integers, so we don't need to
+        // include a byte for the decimal point.
+
+        case REC_DECIMAL_UNSIGNED:
+          len = attr->getPrecision();
+          break;
+
+        case REC_DECIMAL_LS:
+        case REC_DECIMAL_LSE:
+          len = attr->getPrecision() + 1;
+          break;
+
+        case REC_NUM_BIG_SIGNED:
+          {
+            BigNum tmp(attr->getLength(), attr->getPrecision(), attr->getScale(), 0);
+            len = tmp.getDisplayLength();
+          }
+          break;
+
+        case REC_NUM_BIG_UNSIGNED:
+          {
+            BigNum tmp(attr->getLength(), attr->getPrecision(), attr->getScale(), -1);
+            len = tmp.getDisplayLength();
+          }
+          break;
+
+        case REC_DATETIME:
+          switch (attr->getPrecision())
+          {
+            // Time values are stored as integers (number of seconds or fractions of
+            // a second). Dates and timestamps are stored in datetime format.
+            case REC_DTCODE_TIME:
+              // We could make len shorter in some cases by taking fractional
+              // seconds precision into account; for now we assume max.
+              len = SQL_LARGE_DISPLAY_SIZE;
+              break;
+            case REC_DTCODE_DATE:
+            case REC_DTCODE_TIMESTAMP:
+              len = ExpDatetime::getDisplaySize(attr->getPrecision(), attr->getScale());
+              break;
+            default:
+              {
+                char msg[100];
+                snprintf(msg, sizeof msg, "Invalid datetime subcode -- %d.\n",
+                         attr->getPrecision());
+                ex_assert(false, msg);
+              }
+              break;
+          }
+          break;
+
+        default:
+          if (DFS2REC::isInterval(attr->getDatatype()))
+            {
+              // We write intervals to the Hive file in the same internal format
+              // they are stored in (signed 2, 4, or 8 byte integer).
+              switch (attr->getLength())
+              {
+                case 2:
+                  len = SQL_SMALL_DISPLAY_SIZE;
+                  break;
+                case 4:
+                  len = SQL_INT_DISPLAY_SIZE;
+                  break;
+                case 8:
+                  len = SQL_LARGE_DISPLAY_SIZE;
+                  break;
+                default:
+                  {
+                    char msg[100];
+                    snprintf(msg, sizeof msg, "Invalid length for interval -- %d.\n",
+                             attr->getLength());
+                    ex_assert(false, msg);
+                  }
+                  break;
+              }
+            }
+          else
+            {
+              char msg[100];
+              snprintf(msg, sizeof msg, "Unknown/unsupported type -- %d.\n",
+                       attr->getLength());
+              ex_assert(false, msg);
+            }
+          break;
+      } // switch
+
+      len += 3;  // 1 byte for field delimiter, 2 additional per col just to be safe
+
+      hiveBuffSz_ += len;
+    } // for
+
+    hiveBuff_ = new(getHeap()) char[hiveBuffSz_];
+}
+
 short ExHbaseAccessTcb::createDirectRowBuffer( UInt16 tuppIndex, 
                  char * tuppRow,
                   Queue * listOfColNames, 
@@ -2446,17 +2609,17 @@ short ExHbaseAccessTcb::createDirectRowBuffer( UInt16 tuppIndex,
                   std::vector<UInt32> * posVec,
                   double samplingRate )
 {
-  char hiveBuff[500]; //@ZXtemp
   size_t hiveBuffInx = 0;
   NABoolean includeInSample = (samplingRate > 0 && (rand() / (double)RAND_MAX) < samplingRate);
   Int16 datatype;
-  Int16 scale = 0;
+  Int16 prec = 0;
   union
   {
-    Int32 i;
-    UInt32 ui;
-    Int64 i64;
     Int16 i16;
+    UInt16 ui16;
+    Int32 i32;
+    UInt32 ui32;
+    Int64 i64;
     float f;
     double d;
   } numUnion;
@@ -2465,8 +2628,7 @@ short ExHbaseAccessTcb::createDirectRowBuffer( UInt16 tuppIndex,
     return createDirectAlignedRowBuffer(tuppIndex, tuppRow, listOfColNames,
                                         isUpdate, posVec);
   ExpTupleDesc * rowTD =
-    hbaseAccessTdb().workCriDesc_->getTupleDescriptor
-    (tuppIndex);
+    hbaseAccessTdb().workCriDesc_->getTupleDescriptor(tuppIndex);
   
   short colNameLen;
   char * colName;
@@ -2488,18 +2650,18 @@ short ExHbaseAccessTcb::createDirectRowBuffer( UInt16 tuppIndex,
   row_.len += sizeof(short);
   rowCurPtr += sizeof(short);
   listOfColNames->position();
-  for (Lng32 i = 0; i <  rowTD->numAttrs(); i++)
+  for (Lng32 attrInx = 0; attrInx <  rowTD->numAttrs(); attrInx++)
     {
-    Attributes * attr;
+      Attributes * attr;
       if (!posVec)
-        attr = rowTD->getAttr(i);
+        attr = rowTD->getAttr(attrInx);
       else
       {
-        attr = rowTD->getAttr((*posVec)[i] -1);
+        attr = rowTD->getAttr((*posVec)[attrInx] -1);
       }
 
       if (attr)
-	{
+        {
          if (!posVec)
          {
            extractColNameFields((char*)listOfColNames->getCurr(),
@@ -2512,101 +2674,247 @@ short ExHbaseAccessTcb::createDirectRowBuffer( UInt16 tuppIndex,
            colName = str + sizeof(short) + sizeof(UInt32);
          }
 
-	  colVal = &tuppRow[attr->getOffset()];
+          colVal = &tuppRow[attr->getOffset()];
 
           if (includeInSample)
             {
-              datatype = attr->getDatatype();
-              if (DFS2REC::isNumeric(datatype))
+              if (attr->getNullFlag() && *(short*)&tuppRow[attr->getNullIndOffset()])
+                hiveBuffInx += snprintf(hiveBuff_+hiveBuffInx, hiveBuffSz_ - hiveBuffInx, "%s|", "<null_data>");
+              else
                 {
-                  scale = attr->getScale();
-                  strncpy((char*)&numUnion, colVal, 8);
+                  datatype = attr->getDatatype();
+
+                  if (DFS2REC::isNumeric(datatype))
+                    memcpy((char*)&numUnion, colVal, 8);
+
+                  switch (datatype)
+                  {
+                    case REC_BIN16_SIGNED:
+                      hiveBuffInx += snprintf(hiveBuff_+hiveBuffInx, hiveBuffSz_ - hiveBuffInx, "%d|", numUnion.i16);
+                      break;
+                    case REC_BIN16_UNSIGNED:
+                    case REC_BPINT_UNSIGNED:
+                      hiveBuffInx += snprintf(hiveBuff_+hiveBuffInx, hiveBuffSz_ - hiveBuffInx, "%d|", numUnion.ui16);
+                      break;
+                    case REC_BIN32_SIGNED:
+                      hiveBuffInx += snprintf(hiveBuff_+hiveBuffInx, hiveBuffSz_ - hiveBuffInx, "%d|", numUnion.i32);
+                      break;
+                    case REC_BIN32_UNSIGNED:
+                      hiveBuffInx += snprintf(hiveBuff_+hiveBuffInx, hiveBuffSz_ - hiveBuffInx, "%d|", numUnion.ui32);
+                      break;
+                    case REC_BIN64_SIGNED:
+                      hiveBuffInx += snprintf(hiveBuff_+hiveBuffInx, hiveBuffSz_ - hiveBuffInx, PF64 "|", numUnion.i64);
+                      break;
+                    case REC_BYTE_F_ASCII:
+                      strncpy(hiveBuff_+hiveBuffInx, colVal, attr->getLength());
+                      hiveBuffInx += attr->getLength();
+                      hiveBuff_[hiveBuffInx++] = '|';
+                      break;
+                    case REC_BYTE_V_ASCII:
+                      colValLen =  attr->getLength(&tuppRow[attr->getVCLenIndOffset()]);
+                      strncpy(hiveBuff_+hiveBuffInx, colVal, colValLen);
+                      hiveBuffInx += colValLen;
+                      hiveBuff_[hiveBuffInx++] = '|';
+                      break;
+                    case REC_BYTE_F_DOUBLE:
+                      {
+                        Int32 ucs2bytes = attr->getLength();
+                        Int32 utf8bytes = 3 * (ucs2bytes / 2);
+                        char* utf8buf = new(STMTHEAP) char[utf8bytes + 1];
+                        memset(utf8buf, 0, utf8bytes+1);
+                        ex_expr::exp_return_type retcode =
+                            convDoIt(colVal, ucs2bytes, datatype, 0, SQLCHARSETCODE_UCS2,
+                                     utf8buf, utf8bytes, REC_BYTE_F_ASCII, ucs2bytes / 2, SQLCHARSETCODE_UTF8,
+                                     NULL, 0,
+                                     STMTHEAP, NULL, CONV_UCS2_F_UTF8_V);
+                        if (retcode == ex_expr::EXPR_OK)
+                          {
+                            strcpy(hiveBuff_+hiveBuffInx, utf8buf);
+                            hiveBuffInx += strlen(utf8buf);
+                            hiveBuff_[hiveBuffInx++] = '|';
+                          }
+                        else
+                          hiveBuffInx += sprintf(hiveBuff_+hiveBuffInx, "retcode=%d|", retcode);
+                        NADELETEBASIC(utf8buf, STMTHEAP);
+                      }
+                      break;
+                    case REC_BYTE_V_DOUBLE:
+                      {
+                        Int32 ucs2bytes = attr->getLength();
+                        Int32 utf8bytes = 3 * (ucs2bytes / 2);
+                        char* utf8buf = new(STMTHEAP) char[utf8bytes + 1];
+                        ex_expr::exp_return_type retcode =
+                            convDoIt(colVal, ucs2bytes, datatype, 0, SQLCHARSETCODE_UCS2,
+                                     utf8buf, utf8bytes, REC_BYTE_F_ASCII, ucs2bytes / 2, SQLCHARSETCODE_UTF8,
+                                     colVal, attr->getVCIndicatorLength(),
+                                     STMTHEAP, NULL, CONV_UCS2_F_UTF8_V);
+                        if (retcode == ex_expr::EXPR_OK)
+                          {
+                            strcpy(hiveBuff_+hiveBuffInx, utf8buf);
+                            hiveBuffInx += strlen(utf8buf);
+                            hiveBuff_[hiveBuffInx++] = '|';
+                          }
+                        else
+                          hiveBuffInx += sprintf(hiveBuff_+hiveBuffInx, "retcode=%d|", retcode);
+                        NADELETEBASIC(utf8buf, STMTHEAP);
+                      }
+                      break;
+                    case REC_FLOAT32:
+                      hiveBuffInx += snprintf(hiveBuff_+hiveBuffInx, hiveBuffSz_ - hiveBuffInx, "%g|", numUnion.f);
+                      break;
+                    case REC_FLOAT64:
+                      hiveBuffInx += snprintf(hiveBuff_+hiveBuffInx, hiveBuffSz_ - hiveBuffInx, "%g|", numUnion.d);
+                      break;
+                    case REC_DECIMAL_UNSIGNED:
+                    case REC_DECIMAL_LSE:
+                      numUnion.i64 = 0;
+                      for (UInt32 i=0; i<attr->getLength(); i++)
+                        numUnion.i64 = numUnion.i64 * 10 + (*(colVal+i) & (char)0x0f);
+                      prec = attr->getPrecision();
+                      if (*colVal < 0) // sign bit of 1st char is set for negative LSE (1st nibble 0xb)
+                        numUnion.i64 *= -1;
+                        hiveBuffInx += snprintf(hiveBuff_+hiveBuffInx, hiveBuffSz_ - hiveBuffInx, PF64 "|", numUnion.i64);
+                      break;
+                    case REC_DATETIME:
+                      switch (attr->getPrecision())
+                      {
+                        case REC_DTCODE_DATE:
+                          memcpy((char*)&numUnion, colVal, 2);
+                          hiveBuffInx += snprintf(hiveBuff_+hiveBuffInx, hiveBuffSz_ - hiveBuffInx,
+                                                  "%.4d-%.2d-%.2d|", numUnion.i16,
+                                                  *(colVal+2), *(colVal+3));
+                          break;
+                        case REC_DTCODE_TIME:
+                          if (attr->getScale() > 0)
+                            {
+                              // Value is some number of fractions of a second, e.g., if
+                              // scale=3, then milliseconds.
+                              memcpy((char*)&numUnion, colVal+3, 4); // fractional part (millisecs, etc.)
+                              numUnion.i64 = numUnion.ui32 +
+                                              ((*colVal * 3600 +     // hour field in seconds
+                                                *(colVal+1) * 60 +   // minute field in seconds
+                                                *(colVal+2))         // seconds field
+                                               * pow(10, attr->getScale())); // scale to fractional precision
+                            }
+                          else
+                            // Scale is 0, so value is just number of seconds.
+                            numUnion.i64 = (*colVal * 3600 + *(colVal+1) * 60 + *(colVal+2));
+                          hiveBuffInx += snprintf(hiveBuff_+hiveBuffInx,
+                                                  hiveBuffSz_ - hiveBuffInx,
+                                                  PF64 "|", numUnion.i64);
+                          break;
+                        case REC_DTCODE_TIMESTAMP:
+                          memcpy((char*)&numUnion, colVal, 2);  // year field
+                          hiveBuffInx += snprintf(hiveBuff_+hiveBuffInx, hiveBuffSz_ - hiveBuffInx,
+                                                  "%.4d-%.2d-%.2d %.2d:%.2d:%.2d", numUnion.i16,
+                                                  *(colVal+2), *(colVal+3),  // month, year
+                                                  *(colVal+4), *(colVal+5), *(colVal+6)); // time
+                          if (attr->getScale() > 0)
+                            {
+                              memcpy((char*)&numUnion, colVal+7, 4);  // frac sec prec field
+                              hiveBuffInx += snprintf(hiveBuff_+hiveBuffInx, hiveBuffSz_ - hiveBuffInx,
+                                                      ".%.*d|", attr->getScale(), numUnion.i32);
+                            }
+                          else
+                            hiveBuff_[hiveBuffInx++] = '|';
+                          break;
+                        default:
+                          {
+                            char msg[100];
+                            snprintf(msg, sizeof msg, "Invalid datetime subcode -- %d.\n",
+                                     attr->getPrecision());
+                            ex_assert(false, msg);
+                          }
+                          break;
+                      }
+                      break;
+                    default:
+                      // All intervals stored internally as integers, scaled if there
+                      // is fractional seconds precision. We write to Hive file as
+                      // this same integer value, so we only need to know whether it
+                      // is 16, 32, or 64 bits.
+                      if (DFS2REC::isInterval(datatype))
+                        {
+                          switch (attr->getLength())
+                          {
+                            case 2:
+                              memcpy((char*)&numUnion, colVal, 2);
+                              hiveBuffInx += snprintf(hiveBuff_+hiveBuffInx, hiveBuffSz_ - hiveBuffInx,
+                                                      "%d|", numUnion.i16);
+                              break;
+                            case 4:
+                              memcpy((char*)&numUnion, colVal, 4);
+                              hiveBuffInx += snprintf(hiveBuff_+hiveBuffInx, hiveBuffSz_ - hiveBuffInx,
+                                                      "%d|", numUnion.i32);
+                              break;
+                            case 8:
+                              memcpy((char*)&numUnion, colVal, 8);
+                              hiveBuffInx += snprintf(hiveBuff_+hiveBuffInx, hiveBuffSz_ - hiveBuffInx,
+                                                      PF64 "|", numUnion.i64);
+                              break;
+                            default:
+                              {
+                                char msg[100];
+                                snprintf(msg, sizeof msg, "Invalid length for interval -- %d.\n",
+                                         attr->getLength());
+                                ex_assert(false, msg);
+                              }
+                              break;
+                          }
+                        }
+                      else
+                        ex_assert(false, "Unknown/unsupported type for writing Hive sample table");
+                      break;
+                  }
                 }
-              switch (datatype)
-              {
-                case REC_BIN32_SIGNED:
-                  hiveBuffInx += snprintf(hiveBuff+hiveBuffInx, 500 - hiveBuffInx, "%d|", numUnion.i);
-                  break;
-                case REC_BIN32_UNSIGNED:
-                  hiveBuffInx += snprintf(hiveBuff+hiveBuffInx, 500 - hiveBuffInx, "%d|", numUnion.ui);
-                  break;
-                case REC_BIN64_SIGNED:
-                  //printf("Scale of column %d is %d\n", i, attr->getScale());
-                  hiveBuffInx += snprintf(hiveBuff+hiveBuffInx, 500 - hiveBuffInx, PFP64 "|", attr->getScale(), numUnion.i64);
-                  if (scale)
-                    {
-                      hiveBuffInx -= (scale + 1);
-                      memmove(hiveBuff+hiveBuffInx+1, hiveBuff+hiveBuffInx, scale + 1);
-                      hiveBuff[hiveBuffInx] = '.';
-                      hiveBuffInx += (scale + 2);
-                    }
-                  break;
-                case REC_BYTE_F_ASCII:
-                  strncpy(hiveBuff+hiveBuffInx, colVal, attr->getLength());
-                  hiveBuffInx += attr->getLength();
-                  hiveBuff[hiveBuffInx++] = '|';
-                  break;
-                case REC_BYTE_V_ASCII:
-                  hiveBuffInx += snprintf(hiveBuff+hiveBuffInx, 500 - hiveBuffInx, "%s|", colVal);
-                  break;
-                case REC_DATETIME:
-                  //@ZXbl -- need to account for datetime code
-                  strncpy((char*)&numUnion, colVal, 2);
-                  hiveBuffInx += snprintf(hiveBuff+hiveBuffInx, 500 - hiveBuffInx,
-                                          "%.4d-%.2d-%.2d|", numUnion.i16,
-                                          *(colVal+1), *(colVal+2));
-                  break;
-                default:
-                  hiveBuffInx += sprintf(hiveBuff+hiveBuffInx, "???|");
-                  break;
-              }
             }
 
-	  prependNullVal = FALSE;
-	  nullVal = 0;
-	  if (attr->getNullFlag())
-	    {
-	      nullVal = *(short*)&tuppRow[attr->getNullIndOffset()];
+          prependNullVal = FALSE;
+          nullVal = 0;
+          if (attr->getNullFlag())
+            {
+              nullVal = *(short*)&tuppRow[attr->getNullIndOffset()];
 
-	      if ((attr->getDefaultClass() != Attributes::DEFAULT_NULL) &&
-		  (nullVal))
-		prependNullVal = TRUE;
-	      else if (isUpdate && nullVal)
-		prependNullVal = TRUE;
-	      else if (! nullVal)
-		prependNullVal = TRUE;
+              if ((attr->getDefaultClass() != Attributes::DEFAULT_NULL) &&
+                  (nullVal))
+                prependNullVal = TRUE;
+              else if (isUpdate && nullVal)
+                prependNullVal = TRUE;
+              else if (! nullVal)
+                prependNullVal = TRUE;
 
-	      if ((NOT prependNullVal) && (nullVal))
-		goto label_end1;
-	    }
+              if ((NOT prependNullVal) && (nullVal))
+                goto label_end1;
+            }
           if (prependNullVal)
           {
              nullValChar = 0;
              if (nullVal)
                 nullValChar = -1;
           }
-     	  colValLen =  attr->getLength(&tuppRow[attr->getVCLenIndOffset()]);
-          Int32 bytesCopied = copyColToDirectBuffer(rowCurPtr, colName, 
+          colValLen =  attr->getLength(&tuppRow[attr->getVCLenIndOffset()]);
+          Int32 bytesCopied = copyColToDirectBuffer(rowCurPtr, colName,
                 colNameLen, prependNullVal, nullValChar, colVal, colValLen);
           rowCurPtr += bytesCopied;
           row_.len += bytesCopied;
           numCols++;
-        }	  
+        }
       else
-	{
-	  ex_assert(false, "Unable to obtain column descriptor");
-	}
-    label_end1:		  
+        {
+          ex_assert(false, "Unable to obtain column descriptor");
+        }
+    label_end1:
       listOfColNames->advance();
-    }	// for
+    }   // for
   *numColsPtr = bswap_16(numCols);
 
   if (includeInSample)
     {
       // Overwrite trailing delimiter with newline.
-      hiveBuff[hiveBuffInx-1] = '\n';
-      hdfsWrite(getHdfs(), getHdfsSampleFile(), hiveBuff, hiveBuffInx);
+      hiveBuff_[hiveBuffInx-1] = '\n';
+      hdfsWrite(getHdfs(), getHdfsSampleFile(), hiveBuff_, hiveBuffInx);
     }
+
   return 0;
 }
 

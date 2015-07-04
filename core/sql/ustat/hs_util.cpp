@@ -131,25 +131,72 @@ NABoolean isSpecialObject(const QualifiedName& qualifiedName)
     return isHBaseMeta(qualifiedName);
 }
 
+// Returns TRUE if the character can be used in a Hive table name without
+// being mapped to another character.
+static NABoolean noTranslationRequired(char ch)
+{
+  return (isupper(ch) || isdigit(ch) || ch == '_');
+}
+
 // Convert a fully-qualified Trafodion table name to the name used for its
 // backing sample table, which is a Hive table. Hive table names only allow
 // letters, digits, and underscores, and are case-insensitive.
-// @ZXbl -- need to do some kind of conversion for other chars besides periods,
-//          to handle delimited ids.
+// @ZXbl -- need to ignore quotes in delimited ids.
 void TrafToHiveSampleTableName(NAString& name)
 {
-  size_t len = name.length();
+  size_t origNameLen = name.length();
+
+  // In addition to the transformed table name, this buffer will also be used to
+  // sprintf the hash value of the original table name, so guard against unlikely
+  // case that it is too short to hold the char* representation of a 32-bit
+  // unsigned integer.
+  size_t allocLen = (origNameLen < 10 ? 11 : origNameLen + 1);
+
+  char* newName = new(STMTHEAP) char[allocLen];
   const char* oldName = name.data();
-  char* newName = new(STMTHEAP) char[len];
-  for (size_t i=0; i<len; i++)
+  NABoolean needHash = FALSE;
+  UInt16 numDots = 0;
+  for (size_t i=0; i<origNameLen; i++)
     {
-      if (oldName[i] == '.')
-        newName[i] = '_';
-      else
+      if (noTranslationRequired(oldName[i]))
         newName[i] = oldName[i];
+      else
+        {
+          if (oldName[i] == '.')
+            {
+              newName[i] = '_';
+              if (++numDots > 2)
+                needHash = TRUE;
+            }
+          else if (islower(oldName[i]))
+            {
+              newName[i] = toupper(oldName[i]);
+              needHash = TRUE;
+            }
+          else
+            {
+              newName[i] = '_';
+              needHash = TRUE;
+            }
+        }
     }
-  strcpy((char*)newName+len, "_SAMPLE");
+
+  // Add null terminator.
+  newName[origNameLen] = '\0';
+
+  // A transformation other than changing the 2 '.' separators for name components
+  // is not guaranteed to produce a unique value, so in these cases a hash of the
+  // original table name is appended to the transformed name. Two names could also
+  // hash to the same value, but this is very unlikely.
   name = newName;
+  if (needHash)
+    {
+      snprintf(newName, allocLen, "_%d",
+               ExHDPHash::hash(oldName, ExHDPHash::NO_FLAGS, origNameLen));
+      name.append(newName);
+    }
+  name.append("_SAMPLE");
+  NADELETEBASIC(newName, STMTHEAP);
 }
 
 // -----------------------------------------------------------------------
@@ -703,7 +750,7 @@ Lng32 FormatRow(const HSColumnStruct *srcDesc,
                 for (short i=0; i < spaceLen; i++)
                   wStr.append(L" ");
                 wStr.append( (inData+((signPresent) ? 1 : 0)+spaceLen),
-			     (inDataLen/sizeof(NAWchar)-((signPresent) ? 1 : 0)-spaceLen));
+                             (inDataLen/sizeof(NAWchar)-((signPresent) ? 1 : 0)-spaceLen));
                 wStr.append(WIDE_("'"));
 
                 switch (srcDesc->datatype)
